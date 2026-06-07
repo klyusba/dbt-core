@@ -1,0 +1,29 @@
+[package]
+authors.workspace = true
+description = "dbt daemon for persistent in-memory execution state across invocations"
+edition.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+license.workspace = true
+name = "dbt-daemon"
+repository.workspace = true
+version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dbt-clap-core = { workspace = true }
+dbt-common = { workspace = true }
+dbt-features = { workspace = true }
+dbt-main = { workspace = true }
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[[bin]]
+doctest = false
+name = "dbt-daemon"
+path = "src/main.rs"
