@@ -31,9 +31,8 @@ DBT_BIN     = os.environ.get("DBT_BIN",    "dbt")
 DAEMON_BIN  = os.environ.get("DAEMON_BIN", "dbt-daemon")
 SOCKET_PATH = os.environ.get("DAEMON_SOCKET", "/tmp/dbt-benchmark-daemon.sock")
 
-N_PARSE = 5          # how many times to repeat `dbt parse`
 # Model indices to sample for `dbt run --select X` (spread across chain)
-SAMPLE_INDICES = list(range(50, 1000, 50))  # [50, 100, 150, …, 950] — 19 models
+SAMPLE_INDICES = list(range(1, 200))
 DAEMON_WARMUP_MODELS = 2  # dummy runs before daemon timing starts
 
 COMMON_FLAGS = [
@@ -110,17 +109,6 @@ def full_run() -> float:
     print("  Running all 1 000 models to populate the database …", flush=True)
     elapsed, _ = run([DBT_BIN, "run"] + COMMON_FLAGS)
     return elapsed
-
-
-# ── dbt parse benchmark ───────────────────────────────────────────────────────
-
-def bench_parse() -> List[float]:
-    times = []
-    for i in range(N_PARSE):
-        elapsed, _ = run([DBT_BIN, "parse"] + COMMON_FLAGS)
-        times.append(elapsed)
-        print(f"    run {i + 1}/{N_PARSE}: {fmt_ms(elapsed)}", flush=True)
-    return times
 
 
 # ── dbt run --select X benchmark ─────────────────────────────────────────────
@@ -273,25 +261,21 @@ def main() -> None:
     print("═" * 70)
 
     # Step 1 — generate project
-    print("\n[1/6] Generating dbt project …", flush=True)
+    print("\n[1/5] Generating dbt project …", flush=True)
     generate_project()
 
     # Step 2 — driver warm-up (downloads ADBC DuckDB driver if absent)
-    print("\n[2/6] Driver warm-up …", flush=True)
+    print("\n[2/5] Driver warm-up …", flush=True)
     warmup_driver()
 
     # Step 3 — full run to populate every model's table
-    print("\n[3/6] Full dbt run (initial materialisation) …", flush=True)
+    print("\n[3/5] Full dbt run (initial materialisation) …", flush=True)
     full_run_time = full_run()
     print(f"  Completed in {fmt_ms(full_run_time)}", flush=True)
 
-    # Step 4 — dbt parse benchmark
-    print(f"\n[4/6] Benchmarking dbt parse ({N_PARSE} runs) …", flush=True)
-    parse_times = bench_parse()
-
-    # Step 5 — dbt run --select X (one model per process)
+    # Step 4 — dbt run --select X (one model per process)
     print(
-        f"\n[5/6] Benchmarking dbt run --select X "
+        f"\n[4/5] Benchmarking dbt run --select X "
         f"({len(SAMPLE_INDICES)} models, one per invocation) …",
         flush=True,
     )
@@ -301,7 +285,7 @@ def main() -> None:
     daemon_times: List[float] = []
     if shutil.which(DAEMON_BIN):
         print(
-            f"\n[6/6] Benchmarking dbt-daemon run --select X "
+            f"\n[5/5] Benchmarking dbt-daemon run --select X "
             f"({len(SAMPLE_INDICES)} models) …",
             flush=True,
         )
@@ -310,7 +294,7 @@ def main() -> None:
         except Exception as exc:
             print(f"  WARNING: daemon benchmark failed — {exc}", flush=True)
     else:
-        print(f"\n[6/6] {DAEMON_BIN} not found — skipping daemon benchmark.",
+        print(f"\n[5/5] {DAEMON_BIN} not found — skipping daemon benchmark.",
               flush=True)
 
     # Step 7 — print results
