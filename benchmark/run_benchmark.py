@@ -32,7 +32,7 @@ DAEMON_BIN  = os.environ.get("DAEMON_BIN", "dbt-daemon")
 SOCKET_PATH = os.environ.get("DAEMON_SOCKET", "/tmp/dbt-benchmark-daemon.sock")
 
 # Model indices to sample for `dbt run --select X` (spread across chain)
-SAMPLE_INDICES = list(range(1, 200))
+SAMPLE_INDICES = list(range(1, 100, 5))
 DAEMON_WARMUP_MODELS = 2  # dummy runs before daemon timing starts
 
 COMMON_FLAGS = [
