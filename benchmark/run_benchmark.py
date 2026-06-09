@@ -208,7 +208,6 @@ def bench_daemon(indices: List[int]) -> List[float]:
 # ── results printer ───────────────────────────────────────────────────────────
 
 def print_results(
-    parse_times:  List[float],
     run_times:    List[float],
     daemon_times: List[float],
     full_run_time: float,
@@ -223,11 +222,6 @@ def print_results(
         print(f"║  {label:<40}  {value:>20}  ║")
 
     row("Full dbt run (1 000 models, setup)", fmt_ms(full_run_time))
-    print(f"║  {sep[:66]}  ║")
-
-    row(f"dbt parse  (n={N_PARSE}, median)",
-        fmt_ms(statistics.median(parse_times)))
-    row("  mean ± stdev", fmt_stats(parse_times))
     print(f"║  {sep[:66]}  ║")
 
     row(f"dbt run --select X  (n={len(run_times)} models)",
@@ -298,7 +292,7 @@ def main() -> None:
               flush=True)
 
     # Step 7 — print results
-    print_results(parse_times, run_times, daemon_times, full_run_time)
+    print_results(run_times, daemon_times, full_run_time)
 
 
 if __name__ == "__main__":
