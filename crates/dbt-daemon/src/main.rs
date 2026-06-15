@@ -32,6 +32,7 @@
 //! alias dbt='dbt-daemon'
 //! ```
 
+mod cache;
 mod client;
 mod protocol;
 mod server;
