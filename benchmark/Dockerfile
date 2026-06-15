@@ -37,12 +37,14 @@ ENV CARGO_PROFILE_RELEASE_LTO=off \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=3
 
-RUN cargo build --release \
+RUN --mount=type=cache,target=/src/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo build --release \
         --no-default-features \
         -p dbt-sa-cli \
         -p dbt-daemon \
         -j4 \
-    && strip target/release/dbt-sa-cli target/release/dbt-daemon
+    && cp target/release/dbt-daemon /out/dbt-daemon
 
 
 # ── Stage 2: Benchmark runtime ────────────────────────────────────────────────
