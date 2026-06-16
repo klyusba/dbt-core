@@ -55,7 +55,6 @@ members = [
   "crates/dbt-jinja-utils",
   "crates/dbt-main",
   "crates/dbt-sa-cli",
-  "crates/dbt-daemon",
   "crates/dbt-xdbc",
   "crates/xdbc-record-replay",
   "crates/dbt-deps",
