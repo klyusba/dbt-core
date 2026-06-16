@@ -42,9 +42,8 @@ RUN --mount=type=cache,target=/src/target \
     cargo build --release \
         --no-default-features \
         -p dbt-sa-cli \
-        -p dbt-daemon \
         -j4 \
-    && cp target/release/dbt-daemon /out/dbt-daemon
+    && cp target/release/dbt /out/dbt
 
 
 # ── Stage 2: Benchmark runtime ────────────────────────────────────────────────
@@ -57,7 +56,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Expose the binaries as `dbt` and `dbt-daemon`.
 COPY --from=builder /src/target/release/dbt-sa-cli  /usr/local/bin/dbt
-COPY --from=builder /src/target/release/dbt-daemon  /usr/local/bin/dbt-daemon
 
 # Copy benchmark scripts
 COPY benchmark/generate_project.py /benchmark/generate_project.py
@@ -69,7 +67,5 @@ WORKDIR /benchmark
 # $XDG_CACHE_HOME).  Network access is required at container runtime.
 ENV BENCHMARK_PROJECT_DIR=/tmp/benchmark_project
 ENV DBT_BIN=dbt
-ENV DAEMON_BIN=dbt-daemon
-ENV DAEMON_SOCKET=/tmp/dbt-benchmark-daemon.sock
 
 CMD ["python3", "/benchmark/run_benchmark.py"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark dbt-sa-cli (dbt) and dbt-daemon against a 1000-model chain project.
+"""Benchmark dbt-sa-cli (dbt) against a 1000-model chain project.
 
 Steps
 ─────
@@ -7,33 +7,26 @@ Steps
 2. Driver warm-up: run model_0001 once so the ADBC DuckDB driver is downloaded
    and cached before timing begins.
 3. Full materialisation: dbt run (all models) so every upstream table exists.
-4. Benchmark  dbt parse         — N_PARSE runs, report median + stdev.
-5. Benchmark  dbt run --select  — SAMPLE_MODELS models, one dbt invocation each,
+4. Benchmark  dbt run --select  — SAMPLE_MODELS models, one dbt invocation each,
                                    report mean + stdev.
-6. Start dbt-daemon, warm it up, then repeat step 5 via dbt-daemon.
-7. Print a results table.
+5. Benchmark  dbt run (stdin loop) — same models piped via stdin to a single
+                                   long-lived process; parse overhead paid once.
+6. Print a comparison table.
 """
 import os
-import shutil
-import signal
-import socket
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 # ── tunables ──────────────────────────────────────────────────────────────────
 PROJECT_DIR = os.environ.get("BENCHMARK_PROJECT_DIR", "/tmp/benchmark_project")
-DBT_BIN     = os.environ.get("DBT_BIN",    "dbt")
-DAEMON_BIN  = os.environ.get("DAEMON_BIN", "dbt-daemon")
-SOCKET_PATH = os.environ.get("DAEMON_SOCKET", "/tmp/dbt-benchmark-daemon.sock")
+DBT_BIN     = os.environ.get("DBT_BIN", "dbt")
 
-# Model indices to sample for `dbt run --select X` (spread across chain)
+# Model indices to sample for both benchmark modes (spread across chain).
 SAMPLE_INDICES = list(range(1, 100, 5))
-DAEMON_WARMUP_MODELS = 2  # dummy runs before daemon timing starts
 
 COMMON_FLAGS = [
     "--project-dir", PROJECT_DIR,
@@ -111,9 +104,10 @@ def full_run() -> float:
     return elapsed
 
 
-# ── dbt run --select X benchmark ─────────────────────────────────────────────
+# ── dbt run --select X benchmark (one process per model) ─────────────────────
 
 def bench_run_single(indices: List[int]) -> List[float]:
+    """Spawn a fresh dbt process for each model selector. Returns per-run times."""
     times = []
     for idx in indices:
         m = model_name(idx)
@@ -123,99 +117,55 @@ def bench_run_single(indices: List[int]) -> List[float]:
     return times
 
 
-# ── daemon helpers ────────────────────────────────────────────────────────────
+# ── dbt run stdin-loop benchmark (one process, N selectors via stdin) ─────────
 
-def wait_for_socket(path: str, timeout: float = 60.0) -> bool:
-    """Block until the Unix socket at *path* is connectable or timeout."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(1.0)
-            s.connect(path)
-            s.close()
-            return True
-        except (OSError, ConnectionRefusedError):
-            time.sleep(0.2)
-    return False
+def bench_run_stdin(indices: List[int]) -> Tuple[float, int]:
+    """Pipe all model selectors into a single dbt run process via stdin.
 
+    The compilation.rs stdin loop reads one selector per line, builds a fresh
+    schedule for it, and executes the tasks — parse overhead is paid only once.
+    An empty line (EOF) terminates the loop.
 
-def start_daemon() -> subprocess.Popen:
-    if Path(SOCKET_PATH).exists():
-        Path(SOCKET_PATH).unlink(missing_ok=True)
-    log = open("/tmp/dbt-daemon.log", "w")
-    # Start the daemon with an explicit socket path.
-    proc = subprocess.Popen(
-        [DAEMON_BIN, "serve", "--socket", SOCKET_PATH],
-        stdout=log,
-        stderr=log,
-    )
-    print(f"  Daemon PID {proc.pid}, socket {SOCKET_PATH}", flush=True)
-    return proc
-
-
-def stop_daemon(proc: subprocess.Popen) -> None:
-    proc.send_signal(signal.SIGTERM)
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-    if Path(SOCKET_PATH).exists():
-        Path(SOCKET_PATH).unlink(missing_ok=True)
-
-
-def daemon_run(model: str) -> float:
-    """Send one `dbt run --select <model>` to the running daemon.
-
-    The socket path is communicated via DBT_DAEMON_SOCKET so the --socket flag
-    is NOT included in the forwarded args (the daemon server re-parses args with
-    the dbt CLI parser which does not know --socket).
+    Returns (total_elapsed_seconds, number_of_selectors).
     """
-    env = os.environ.copy()
-    env["DBT_DAEMON_SOCKET"] = SOCKET_PATH
-    cmd = [DAEMON_BIN, "run", "--select", model] + COMMON_FLAGS
-    elapsed, _ = run(cmd, env=env)
-    return elapsed
+    selectors = "\n".join(model_name(idx) for idx in indices) + "\n"
 
+    t0 = time.perf_counter()
+    result = subprocess.run(
+        [DBT_BIN, "run"] + COMMON_FLAGS,
+        input=selectors.encode(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    elapsed = time.perf_counter() - t0
 
-def bench_daemon(indices: List[int]) -> List[float]:
-    proc = start_daemon()
-    try:
-        print("  Waiting for daemon socket …", flush=True)
-        if not wait_for_socket(SOCKET_PATH, timeout=120):
-            raise RuntimeError("Daemon did not become ready within 120 s")
-        print("  Daemon ready.", flush=True)
+    if result.returncode != 0:
+        stderr = result.stderr.decode(errors="replace")
+        stdout = result.stdout.decode(errors="replace")
+        raise RuntimeError(
+            f"dbt stdin run failed (rc={result.returncode}):\n"
+            f"--- stdout ---\n{stdout[-2000:]}\n"
+            f"--- stderr ---\n{stderr[-2000:]}"
+        )
 
-        # warm-up: let the daemon parse + materialise a couple of models
-        print(f"  Daemon warm-up ({DAEMON_WARMUP_MODELS} invocations) …",
-              flush=True)
-        for i in range(DAEMON_WARMUP_MODELS):
-            t = daemon_run(model_name(SAMPLE_INDICES[i]))
-            print(f"    warm-up {i + 1}: {fmt_ms(t)}", flush=True)
-
-        # timed runs
-        times = []
-        for idx in indices:
-            m = model_name(idx)
-            elapsed = daemon_run(m)
-            times.append(elapsed)
-            print(f"    {m}: {fmt_ms(elapsed)}", flush=True)
-        return times
-    finally:
-        stop_daemon(proc)
-
+    return elapsed, len(indices)
 
 # ── results printer ───────────────────────────────────────────────────────────
 
 def print_results(
-    run_times:    List[float],
-    daemon_times: List[float],
+    run_times: List[float],
+    stdin_total: float,
     full_run_time: float,
 ) -> None:
+    n = len(run_times)
+    single_total = sum(run_times)
+    stdin_avg = stdin_total / n if n else 0.0
+    speedup = single_total / stdin_total if stdin_total > 0 else float("inf")
+
     sep = "─" * 70
     print()
     print("╔══════════════════════════════════════════════════════════════════╗")
-    print("║                  dbt benchmark results (1 000 models)           ║")
+    print("║                  dbt benchmark results (1 000 models)            ║")
     print("╠══════════════════════════════════════════════════════════════════╣")
 
     def row(label: str, value: str) -> None:
@@ -224,25 +174,18 @@ def print_results(
     row("Full dbt run (1 000 models, setup)", fmt_ms(full_run_time))
     print(f"║  {sep[:66]}  ║")
 
-    row(f"dbt run --select X  (n={len(run_times)} models)",
-        "")
+    row(f"dbt run --select X  (n={n}, separate processes)", "")
     row("  mean ± stdev (per invocation)", fmt_stats(run_times))
-    row("  min", fmt_ms(min(run_times)))
-    row("  max", fmt_ms(max(run_times)))
+    row("  min / max", f"{fmt_ms(min(run_times))} / {fmt_ms(max(run_times))}")
+    row("  total", fmt_ms(single_total))
     print(f"║  {sep[:66]}  ║")
 
-    if daemon_times:
-        row(f"dbt-daemon run --select X  (n={len(daemon_times)} models)",
-            "")
-        row("  mean ± stdev (per invocation)", fmt_stats(daemon_times))
-        row("  min", fmt_ms(min(daemon_times)))
-        row("  max", fmt_ms(max(daemon_times)))
+    row(f"dbt run stdin loop  (n={n}, single process)", "")
+    row("  total", fmt_ms(stdin_total))
+    row("  avg per selector", fmt_ms(stdin_avg))
+    print(f"║  {sep[:66]}  ║")
 
-        speedup = statistics.mean(run_times) / statistics.mean(daemon_times)
-        row("  speedup vs plain dbt run", f"{speedup:.2f}×")
-    else:
-        row("dbt-daemon", "SKIPPED")
-
+    row("Speedup  (stdin loop vs separate processes)", f"{speedup:.2f}×")
     print("╚══════════════════════════════════════════════════════════════════╝")
     print()
 
@@ -255,44 +198,39 @@ def main() -> None:
     print("═" * 70)
 
     # Step 1 — generate project
-    print("\n[1/5] Generating dbt project …", flush=True)
+    print("\n[1/4] Generating dbt project …", flush=True)
     generate_project()
 
     # Step 2 — driver warm-up (downloads ADBC DuckDB driver if absent)
-    print("\n[2/5] Driver warm-up …", flush=True)
+    print("\n[2/4] Driver warm-up …", flush=True)
     warmup_driver()
 
     # Step 3 — full run to populate every model's table
-    print("\n[3/5] Full dbt run (initial materialisation) …", flush=True)
+    print("\n[3/4] Full dbt run (initial materialisation) …", flush=True)
     full_run_time = full_run()
     print(f"  Completed in {fmt_ms(full_run_time)}", flush=True)
 
-    # Step 4 — dbt run --select X (one model per process)
+    # Step 4a — separate-process baseline: one dbt invocation per model
     print(
-        f"\n[4/5] Benchmarking dbt run --select X "
-        f"({len(SAMPLE_INDICES)} models, one per invocation) …",
+        f"\n[4/4] Benchmarking {len(SAMPLE_INDICES)} models …",
+        flush=True,
+    )
+    print(
+        f"  4a) separate processes ({len(SAMPLE_INDICES)} invocations) …",
         flush=True,
     )
     run_times = bench_run_single(SAMPLE_INDICES)
 
-    # Step 6 — dbt-daemon run --select X
-    daemon_times: List[float] = []
-    if shutil.which(DAEMON_BIN):
-        print(
-            f"\n[5/5] Benchmarking dbt-daemon run --select X "
-            f"({len(SAMPLE_INDICES)} models) …",
-            flush=True,
-        )
-        try:
-            daemon_times = bench_daemon(SAMPLE_INDICES)
-        except Exception as exc:
-            print(f"  WARNING: daemon benchmark failed — {exc}", flush=True)
-    else:
-        print(f"\n[5/5] {DAEMON_BIN} not found — skipping daemon benchmark.",
-              flush=True)
+    # Step 4b — stdin-loop: single dbt process, all selectors piped via stdin
+    print(
+        f"\n  4b) stdin loop (single process, {len(SAMPLE_INDICES)} selectors) …",
+        flush=True,
+    )
+    stdin_total, _ = bench_run_stdin(SAMPLE_INDICES)
+    print(f"    total: {fmt_ms(stdin_total)}", flush=True)
 
-    # Step 7 — print results
-    print_results(run_times, daemon_times, full_run_time)
+    # Print comparison table
+    print_results(run_times, stdin_total, full_run_time)
 
 
 if __name__ == "__main__":

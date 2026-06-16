@@ -1873,53 +1873,114 @@ impl DbtProjectCompilation {
         let tasks_for_node_factory = Arc::clone(&feature_stack.task_runner.tasks_for_node_factory);
         let compare_task_graph_builder =
             feature_stack.task_runner.compare_task_graph_builder.clone();
-        let graph_builder = GraphBuilder::new(
-            Arc::clone(&run_task_args),
-            Arc::clone(&static_analysis_buckets),
-            tasks_for_node_factory,
-            compare_task_graph_builder,
-        );
+        let ctx_factory = Arc::clone(&feature_stack.task_runner.task_runner_ctx_factory);
 
-        // Increment counters used in final run reporting
-        schedule.selected_nodes.iter().for_each(|unique_id| {
-            increment_metric(
-                FusionMetricKey::NodeCounts(
-                    self.resolved_state
-                        .nodes
-                        .get_node(unique_id)
-                        .expect("Node must exist")
-                        .resource_type(),
-                ),
-                1,
-            )
-        });
-
-        let hooks = task_runner_hooks_factory.create(
-            dbt_cloud_config,
-            maybe_previous_state.clone(),
+        // Create the task_runner instance. `TaskRunner::run` consumes `self`, so the runner is
+        // rebuilt from the same Arc-wrapped resources at the start of each loop iteration.
+        let task_runner = TaskRunner::new(
+            task_runner_hooks_factory.create(
+                dbt_cloud_config.clone(),
+                maybe_previous_state.clone(),
+                adapter.clone(),
+                Arc::clone(&resolved_state),
+                Arc::clone(&jinja_env),
+                schema_store.clone(),
+                data_store.clone(),
+                metricflow_server_client.clone(),
+            ),
             adapter.clone(),
             Arc::clone(&resolved_state),
             Arc::clone(&jinja_env),
             schema_store.clone(),
             data_store.clone(),
-            metricflow_server_client,
-        );
-        let task_runner = TaskRunner::new(
-            hooks,
-            adapter.clone(),
-            resolved_state,
-            jinja_env,
-            schema_store.clone(),
-            data_store.clone(),
             compiled_sql_cache.clone(),
-            Arc::clone(&feature_stack.task_runner.task_runner_ctx_factory),
-            static_analysis_buckets,
+            Arc::clone(&ctx_factory),
+            Arc::clone(&static_analysis_buckets),
         );
-        let run_task_results = {
-            if run_task_args.command == FsCommand::Extension("jinja-check")
-                || should_skip_tasks_when_no_selected_nodes(&run_task_args.command, &schedule)
+
+        let mut pending_runner = task_runner;
+        let mut pending_freshness = freshness_results;
+        let mut run_task_results: Option<RunTaskResults> = None;
+
+        // Wait for user input on stdin; each non-empty line is treated as a dbt selector
+        // expression used to build a new schedule. An empty line (EOF) terminates the loop.
+        loop {
+            use tokio::io::AsyncBufReadExt as _;
+
+            let mut line = String::new();
+            tokio::io::BufReader::new(tokio::io::stdin())
+                .read_line(&mut line)
+                .await
+                .map_err(|e| fs_err!(ErrorCode::Generic, "failed to read stdin: {e}"))?;
+
+            let select = line.trim();
+            if select.is_empty() {
+                break;
+            }
+
+            // Use the user input to prepare a new schedule.
+            use dbt_common::node_selector::parse_model_specifiers;
+            let select_expr = parse_model_specifiers(&[select.to_string()])?;
+            let new_schedule = schedule_with_select(
+                &self.resolved_state,
+                SchedulerArgs::from_eval_args(arg),
+                maybe_previous_state.as_ref().map(|x| x.as_ref()),
+                select_expr,
+                None,
+                arg.local_execution_backend,
+                token,
+            )
+            .await?;
+
+            // Increment counters used in final run reporting.
+            new_schedule.selected_nodes.iter().for_each(|unique_id| {
+                increment_metric(
+                    FusionMetricKey::NodeCounts(
+                        self.resolved_state
+                            .nodes
+                            .get_node(unique_id)
+                            .expect("Node must exist")
+                            .resource_type(),
+                    ),
+                    1,
+                )
+            });
+
+            let graph_builder = GraphBuilder::new(
+                Arc::clone(&run_task_args),
+                Arc::clone(&static_analysis_buckets),
+                Arc::clone(&tasks_for_node_factory),
+                compare_task_graph_builder.clone(),
+            );
+
+            // Consume the current runner for this iteration and pre-build the next one from
+            // the same shared resources so it is ready when the loop comes back around.
+            let runner = pending_runner;
+            pending_runner = TaskRunner::new(
+                task_runner_hooks_factory.create(
+                    dbt_cloud_config.clone(),
+                    maybe_previous_state.clone(),
+                    adapter.clone(),
+                    Arc::clone(&resolved_state),
+                    Arc::clone(&jinja_env),
+                    schema_store.clone(),
+                    data_store.clone(),
+                    metricflow_server_client.clone(),
+                ),
+                adapter.clone(),
+                Arc::clone(&resolved_state),
+                Arc::clone(&jinja_env),
+                schema_store.clone(),
+                data_store.clone(),
+                compiled_sql_cache.clone(),
+                Arc::clone(&ctx_factory),
+                Arc::clone(&static_analysis_buckets),
+            );
+
+            let result = if run_task_args.command == FsCommand::Extension("jinja-check")
+                || should_skip_tasks_when_no_selected_nodes(&run_task_args.command, &new_schedule)
             {
-                task_runner.into_empty_results()?
+                runner.into_empty_results()?
             } else {
                 // Whether any selected node is in the dynamic closure so we only register hook UDFs
                 // when strict/unsafe analysis will actually bind plans.
@@ -1929,40 +1990,47 @@ impl DbtProjectCompilation {
                         ExecutionPhase::TaskGraphBuild,
                     ))
                     .entered();
-                    graph_builder.build(&schedule, &task_runner.resolved_state)
+                    graph_builder.build(&new_schedule, &runner.resolved_state)
                 }?;
 
                 if run_task_args.io.should_show(ShowOptions::TaskGraph) {
-                    task_runner.show_taskgraph(&graph);
+                    runner.show_taskgraph(&graph);
                 }
 
-                task_runner
-                    .register_seeds_for_selected_ids(run_task_args.as_ref(), &schedule)
+                runner
+                    .register_seeds_for_selected_ids(run_task_args.as_ref(), &new_schedule)
                     .await?;
 
-                let ctx = task_runner
+                let ctx = runner
                     .create_context(
                         Arc::clone(&run_task_args),
                         generic_test_relationships,
                         &graph,
                         base_context.clone(),
-                        schedule.clone(),
-                        freshness_results,
+                        new_schedule.clone(),
+                        pending_freshness.take(),
                     )
                     .await?;
 
-                task_runner
+                runner
                     .run(
                         Arc::clone(&run_task_args),
-                        schedule,
-                        base_context,
+                        new_schedule,
+                        base_context.clone(),
                         ctx,
                         graph,
                         has_dynamic_closure,
                         token.clone(),
                     )
                     .await?
-            }
+            };
+
+            run_task_results = Some(result);
+        }
+
+        let run_task_results = match run_task_results {
+            Some(r) => r,
+            None => pending_runner.into_empty_results()?,
         };
 
         token.check_cancellation()?;
