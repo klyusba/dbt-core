@@ -1,7 +1,7 @@
 # ╔══════════════════════════════════════════════════════════════════════════╗
 # ║  dbt benchmark image                                                    ║
 # ║                                                                         ║
-# ║  Stage 1 (builder) — compiles dbt-sa-cli + dbt-daemon from source      ║
+# ║  Stage 1 (builder) — compiles dbt-sa-cli from source                   ║
 # ║  Stage 2 (benchmark) — runs the synthetic 1 000-model benchmark        ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
@@ -37,13 +37,14 @@ ENV CARGO_PROFILE_RELEASE_LTO=off \
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4 \
     CARGO_PROFILE_RELEASE_OPT_LEVEL=3
 
+RUN mkdir -p /out
 RUN --mount=type=cache,target=/src/target \
     --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release \
         --no-default-features \
         -p dbt-sa-cli \
         -j4 \
-    && cp target/release/dbt /out/dbt
+    && cp target/release/dbt-sa-cli /out/dbt
 
 
 # ── Stage 2: Benchmark runtime ────────────────────────────────────────────────
@@ -54,8 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Expose the binaries as `dbt` and `dbt-daemon`.
-COPY --from=builder /src/target/release/dbt-sa-cli  /usr/local/bin/dbt
+COPY --from=builder /out/dbt /usr/local/bin/dbt
 
 # Copy benchmark scripts
 COPY benchmark/generate_project.py /benchmark/generate_project.py
