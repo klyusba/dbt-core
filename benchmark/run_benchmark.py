@@ -31,8 +31,8 @@ SAMPLE_INDICES = list(range(1, 100, 5))
 COMMON_FLAGS = [
     "--project-dir", PROJECT_DIR,
     "--profiles-dir", PROJECT_DIR,
-    # "--log-level", "off",
-    "--debug",
+    "--log-level", "off",
+    # "--debug",
     "--no-write-json",
 ]
 
@@ -46,16 +46,14 @@ def run(
     input: Optional[str] = None,
 ) -> Tuple[float, int]:
     """Run *cmd*, return (wall_seconds, returncode)."""
-    t0 = time.perf_counter()
     if isinstance(input, str):
         input = input.encode()
+
+    t0 = time.perf_counter()
     result = subprocess.run(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, input=input
     )
     elapsed = time.perf_counter() - t0
-
-    stdout = result.stdout.decode(errors="replace")
-    print(stdout[-2000:])
 
     if check and result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
