@@ -1905,13 +1905,14 @@ impl DbtProjectCompilation {
         // Wait for user input on stdin; each non-empty line is treated as a dbt selector
         // expression used to build a new schedule. An empty line (EOF) terminates the loop.
         loop {
-            use tokio::io::AsyncBufReadExt as _;
-
-            let mut line = String::new();
-            tokio::io::BufReader::new(tokio::io::stdin())
-                .read_line(&mut line)
-                .await
-                .map_err(|e| fs_err!(ErrorCode::Generic, "failed to read stdin: {e}"))?;
+            let line = tokio::task::spawn_blocking(|| {
+                let mut buf = String::new();
+                std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut buf)
+                    .map(|_| buf)
+            })
+            .await
+            .map_err(|e| fs_err!(ErrorCode::Generic, "stdin task panicked: {e}"))?
+            .map_err(|e| fs_err!(ErrorCode::Generic, "failed to read stdin: {e}"))?;
 
             let select = line.trim();
             if select.is_empty() {
