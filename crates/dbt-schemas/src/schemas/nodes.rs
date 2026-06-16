@@ -187,7 +187,7 @@ impl InternalDbtNodeWrapper {
 /// - [`Executable`](Self::Executable) — the run-ready SQL under `target/run/`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodePathKind {
-    /// The original source file (sql for most nodes, yml for tests & yml-defined snapshots).
+    /// The original source file where the node is defined.
     Definition,
     /// The compiled SQL path (`target/compiled/…`).
     Compiled,
@@ -195,9 +195,9 @@ pub enum NodePathKind {
     Executable,
 }
 
-/// Most call-sites that surface a node path already know their [`ExecutionPhase`].
-/// This conversion lets them pass the phase directly and get the right path kind
-/// without hard-coding the mapping at every call-site.
+/// Maps an [`ExecutionPhase`] to the corresponding node path kind for phase-aware
+/// reporting. The node path API still decides what each kind means for the
+/// specific node type.
 impl From<ExecutionPhase> for NodePathKind {
     fn from(phase: ExecutionPhase) -> Self {
         match phase {
@@ -301,15 +301,19 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
     ///
     /// Callers that have an [`ExecutionPhase`] can convert it via `.into()`.
     ///
-    /// For models, generic tests, and unit tests the path varies by kind:
+    /// For models, generic tests, unit tests, snapshots, analyses, functions, and seeds the path
+    /// varies by kind (analyses only have a `Compiled` path — they are never materialized/run;
+    /// functions have both `Compiled` and `Executable` paths; seeds only have an `Executable` run
+    /// path beyond the definition path — they are never compiled):
     ///
-    ///   - `Compiled`   - `target/compiled/{package}/{path_segment}` (via `get_target_write_path`)
+    ///   - `Compiled`   - `target/compiled/{package}/{path_segment}` (snapshots use
+    ///     their nested compiled artifact path)
     ///   - `Executable` - `target/run/{package}/{path_segment}/{alias}.sql`
     ///     (mirrors `write_file()` in `run_node_context.rs`; uses `alias` to
     ///     avoid ENAMETOOLONG on Linux for long generic test names)
     ///   - `Definition` - see `get_node_definition_path`
     ///
-    /// For all other node types the definition path is always returned.
+    /// For all other node types the definition path is returned.
     fn get_node_path(
         &self,
         path_kind: NodePathKind,
@@ -319,9 +323,22 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         match (path_kind, self.resource_type()) {
             (
                 NodePathKind::Compiled,
-                NodeType::Model | NodeType::Test | NodeType::UnitTest | NodeType::Snapshot,
+                NodeType::Model
+                | NodeType::Test
+                | NodeType::UnitTest
+                | NodeType::Snapshot
+                | NodeType::Analysis
+                | NodeType::Function,
             )
-            | (NodePathKind::Executable, NodeType::Model | NodeType::Test | NodeType::UnitTest) => {
+            | (
+                NodePathKind::Executable,
+                NodeType::Model
+                | NodeType::Test
+                | NodeType::UnitTest
+                | NodeType::Snapshot
+                | NodeType::Function
+                | NodeType::Seed,
+            ) => {
                 let abs = self.get_node_path_abs(path_kind, in_dir, out_dir);
                 pathdiff::diff_paths(&abs, in_dir).unwrap_or(abs).into()
             }
@@ -329,8 +346,10 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
         }
     }
 
-    /// Absolute counterpart to `get_node_path` for the `Compiled` and `Executable` kinds.
-    /// Useful when the caller needs to pass the path to filesystem APIs directly.
+    /// Constructs the absolute path for the requested kind.
+    ///
+    /// `get_node_path` applies node-kind fallback for display/reporting paths. This lower-level
+    /// helper is for callers that need a concrete artifact or definition path for filesystem use.
     fn get_node_path_abs(&self, path_kind: NodePathKind, in_dir: &Path, out_dir: &Path) -> PathBuf {
         let common = self.common();
         let executable_filename = || {
@@ -383,7 +402,7 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
     ///
     /// This is where the node is defined in the project — independent of execution phase.
     ///
-    /// - Snapshots: relative path to the generated snapshot file in the target directory.
+    /// - Snapshots: the raw YAML/SQL file where the snapshot is defined.
     /// - Generic tests: the YAML file where the test is declared (via `defined_at.file`).
     ///   `original_file_path` is a misnomer for tests — it points at the generated SQL —
     ///   so we prefer `defined_at` when available and fall back to it only if missing.
@@ -391,13 +410,8 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
     fn get_node_definition_path(
         &self,
         in_dir: &Path,
-        out_dir: &Path,
+        _out_dir: &Path,
     ) -> std::borrow::Cow<'_, Path> {
-        if self.resource_type() == NodeType::Snapshot {
-            let out_dir_relative =
-                pathdiff::diff_paths(out_dir, in_dir).unwrap_or_else(|| out_dir.to_owned());
-            return out_dir_relative.join(&self.common().path).into();
-        }
         if self.resource_type() == NodeType::Test
             && let Some(defined_at) = self.defined_at()
         {
@@ -435,33 +449,23 @@ pub trait InternalDbtNode: Any + Send + Sync + fmt::Debug {
             None
         };
 
-        // This is a quirk of historical reporting. For generic tests we report the yml source with line:col location,
-        // but for all other node types we follow the logic described in `get_node_definition_path`.
-        // TODO: streamline and ensure the path's reported via events align with what LSP is being sent
-        let (relative_path, defined_at_line, defined_at_column) = self.defined_at().map_or_else(
-            || {
-                (
-                    self.get_node_path(NodePathKind::Definition, in_dir, out_dir)
-                        .display()
-                        .to_string(),
-                    None,
-                    None,
-                )
-            },
-            |defined_at| {
-                let relative_path = if defined_at.file.is_absolute() {
-                    defined_at
-                        .file
-                        .strip_prefix(in_dir)
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| defined_at.file.display().to_string())
-                } else {
-                    defined_at.file.display().to_string()
-                };
-
-                (relative_path, Some(defined_at.line), Some(defined_at.col))
-            },
-        );
+        // Keep model status/log display on the source definition path for readability.
+        let path_kind = if node_type == NodeType::Model {
+            NodePathKind::Definition
+        } else {
+            phase.into()
+        };
+        let relative_path = self
+            .get_node_path(path_kind, in_dir, out_dir)
+            .display()
+            .to_string();
+        let (defined_at_line, defined_at_column) = if path_kind == NodePathKind::Definition {
+            self.defined_at()
+                .map(|defined_at| (Some(defined_at.line), Some(defined_at.col)))
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
 
         let node_checksum = common.checksum.as_checksum_string().to_string();
 
@@ -1603,7 +1607,29 @@ impl InternalDbtNode for DbtSeed {
             // warnings are logged about this. Implement these warnings later
             // after confirming they make sense. See:
             //https://github.com/dbt-labs/dbt-core/blob/b75d5e701ef4dc2d7a98c5301ef63ecfc02eae15/core/dbt/contracts/graph/nodes.py#L900-L933
-            let same_body_result = same_body(&self.__common_attr__, &other_seed.__common_attr__);
+            let mut same_body_result =
+                same_body(&self.__common_attr__, &other_seed.__common_attr__);
+
+            // Windows migration fallback: the new text-mode seed hash normalizes
+            // CRLF -> LF, so on Windows a freshly computed seed checksum won't match
+            // one stored by the old binary-mode hashing even when the file is
+            // unchanged. Recompute the current seed with the legacy hash and compare
+            // to the previous checksum, mirroring dbt-core's `same_seeds` fallback.
+            if !same_body_result && cfg!(windows) {
+                if let (DbtChecksum::Object(self_cs), Some(root_path)) = (
+                    &self.__common_attr__.checksum,
+                    self.__seed_attr__.root_path.as_ref(),
+                ) {
+                    if self_cs.name == "sha256" {
+                        let seed_path = root_path.join(&self.__common_attr__.path);
+                        if let Ok(bytes) = std::fs::read(&seed_path) {
+                            let legacy = DbtChecksum::seed_content_checksum_legacy(&bytes);
+                            same_body_result = legacy == other_seed.__common_attr__.checksum;
+                        }
+                    }
+                }
+            }
+
             let same_config_result = self.has_same_config(other, adapter_type);
             let same_persisted_desc_result = same_persisted_description(
                 &self.__common_attr__,
@@ -2120,8 +2146,11 @@ impl InternalDbtNode for DbtSource {
                 }
             };
 
-            let quoting_eq =
-                quoting_equal(&self_config.quoting, &other_config.quoting, adapter_type);
+            let quoting_eq = quoting_equal(
+                &self.__source_attr__.user_quoting,
+                &other_source.__source_attr__.user_quoting,
+                adapter_type,
+            );
 
             let loaded_at_field_eq = loaded_at_eq(
                 &self.__source_attr__.loaded_at_field,
@@ -2191,8 +2220,8 @@ impl InternalDbtNode for DbtSource {
                             "quoting",
                             quoting_eq,
                             Some((
-                                format!("{:?}", &self_config.quoting),
-                                format!("{:?}", &other_config.quoting),
+                                format!("{:?}", &self.__source_attr__.user_quoting),
+                                format!("{:?}", &other_source.__source_attr__.user_quoting),
                             )),
                         ),
                         (
@@ -2339,6 +2368,14 @@ impl InternalDbtNode for DbtSnapshot {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn defined_at(&self) -> Option<&dbt_common::CodeLocationWithFile> {
+        if self.__common_attr__.name_span.start.line > 0 {
+            Some(&self.__common_attr__.name_span.start)
+        } else {
+            None
+        }
     }
 
     fn serialize_inner(
@@ -3621,6 +3658,10 @@ impl InternalDbtNodeAttributes for DbtFunction {
     }
 }
 
+// Only the path methods are overridden below. `common()`/`base()` and the
+// `get_node_evaluated_event` default that reads them remain `unimplemented!()`:
+// macros live in a separate `Nodes.macros` map and are never iterated as
+// `&dyn InternalDbtNode` into the runnable/event APIs, so those paths are unreachable.
 impl InternalDbtNode for DbtMacro {
     fn common(&self) -> &CommonAttributes {
         unimplemented!("macro common attributes access")
@@ -3636,6 +3677,27 @@ impl InternalDbtNode for DbtMacro {
     }
     fn resource_type(&self) -> NodeType {
         NodeType::Macro
+    }
+    /// Overridden because the default reads `self.common()`, which panics for
+    /// `DbtMacro` (a flat struct with no `CommonAttributes`). Returns the
+    /// already-project-root-relative `original_file_path` field directly.
+    fn get_node_definition_path(
+        &self,
+        _in_dir: &Path,
+        _out_dir: &Path,
+    ) -> std::borrow::Cow<'_, Path> {
+        self.original_file_path.as_path().into()
+    }
+    /// Overridden so direct callers don't hit the default's `self.common()`,
+    /// which panics for `DbtMacro`. Macros have no compiled/run artifact, so
+    /// every kind resolves to the definition path.
+    fn get_node_path_abs(
+        &self,
+        _path_kind: NodePathKind,
+        in_dir: &Path,
+        out_dir: &Path,
+    ) -> PathBuf {
+        self.get_node_definition_path(in_dir, out_dir).into_owned()
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -4575,7 +4637,7 @@ fn is_false(b: &bool) -> bool {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtExposure {
     pub __common_attr__: CommonAttributes,
@@ -5330,6 +5392,7 @@ impl AdapterAttr {
                     cluster_by: config.cluster_by.clone(),
                     hours_to_expiration: config.hours_to_expiration,
                     job_execution_timeout_seconds: config.job_execution_timeout_seconds,
+                    reservation: config.reservation.clone(),
                     labels: config.labels.clone(),
                     labels_from_meta: config.labels_from_meta,
                     kms_key_name: config.kms_key_name.clone(),
@@ -5432,6 +5495,7 @@ impl AdapterAttr {
                         cluster_by: config.cluster_by.clone(),
                         hours_to_expiration: config.hours_to_expiration,
                         job_execution_timeout_seconds: config.job_execution_timeout_seconds,
+                        reservation: config.reservation.clone(),
                         labels: config.labels.clone(),
                         labels_from_meta: config.labels_from_meta,
                         kms_key_name: config.kms_key_name.clone(),
@@ -5569,6 +5633,7 @@ pub struct BigQueryAttr {
     pub cluster_by: Option<ClusterConfig>,
     pub hours_to_expiration: Option<u64>,
     pub job_execution_timeout_seconds: Option<u64>,
+    pub reservation: Option<String>,
     pub labels: Option<IndexMap<String, String>>,
     pub labels_from_meta: Option<bool>,
     pub kms_key_name: Option<String>,
@@ -5669,18 +5734,529 @@ fn default_introspection() -> IntrospectionKind {
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use serde::Deserialize;
 
     use super::{
-        DbtSnapshot, InternalDbtNodeAttributes, ModelConfig, hooks_equal, normalize_description,
-        persist_docs_configs_equal, quoting_equal,
+        DbtAnalysis, DbtExposure, DbtFunction, DbtMacro, DbtSeed, DbtSnapshot, DbtSource,
+        InternalDbtNode, InternalDbtNodeAttributes, ModelConfig, NodePathKind, hooks_equal,
+        normalize_description, persist_docs_configs_equal, quoting_equal,
     };
     use crate::schemas::common::{Hooks, PersistDocsConfig};
+    use crate::schemas::manifest::{DbtMetric, DbtOperation, DbtSavedQuery};
     use crate::schemas::project::SnapshotMetaColumnNames;
     use dbt_adapter_core::AdapterType;
+    use dbt_common::path::path_separator_eq;
+    use dbt_telemetry::ExecutionPhase;
     use dbt_yaml::Verbatim;
 
     type YmlValue = dbt_yaml::Value;
+
+    fn snapshot_with_paths(name: &str, path: &str, original_file_path: &str) -> DbtSnapshot {
+        let mut snapshot = DbtSnapshot::default();
+        snapshot.__common_attr__.name = name.to_string();
+        snapshot.__common_attr__.package_name = "pkg".to_string();
+        snapshot.__common_attr__.path = PathBuf::from(path);
+        snapshot.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        snapshot.__base_attr__.alias = name.to_string();
+        snapshot
+    }
+
+    #[test]
+    fn yaml_snapshot_node_paths_are_phase_accurate() {
+        let snapshot = snapshot_with_paths(
+            "daily_orders",
+            "snapshots/daily_orders.sql",
+            "snapshots/snapshots.yml",
+        );
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        assert_eq!(
+            snapshot
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            Path::new("snapshots/snapshots.yml")
+        );
+        assert_eq!(
+            snapshot.get_node_path_abs(NodePathKind::Compiled, in_dir, out_dir),
+            PathBuf::from(
+                "/workspace/target/compiled/pkg/snapshots/snapshots.yml/daily_orders.sql"
+            )
+        );
+        assert_eq!(
+            snapshot
+                .get_node_path(NodePathKind::Executable, in_dir, out_dir)
+                .as_ref(),
+            Path::new("target/run/pkg/snapshots/snapshots.yml/snapshots/daily_orders.sql")
+        );
+    }
+
+    fn analysis_with_paths(name: &str, original_file_path: &str) -> DbtAnalysis {
+        let mut analysis = DbtAnalysis::default();
+        analysis.__common_attr__.name = name.to_string();
+        analysis.__common_attr__.package_name = "pkg".to_string();
+        analysis.__common_attr__.path = PathBuf::from(original_file_path);
+        analysis.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        analysis.__base_attr__.alias = name.to_string();
+        analysis
+    }
+
+    #[test]
+    fn analysis_node_paths_are_phase_accurate() {
+        let analysis = analysis_with_paths("my_analysis", "analyses/my_analysis.sql");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        // Parse / Render: raw SQL file (original_file_path).
+        assert_eq!(
+            analysis
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            Path::new("analyses/my_analysis.sql")
+        );
+
+        // Analysis: compiled SQL file.
+        let actual_compiled_path = analysis.get_node_path(NodePathKind::Compiled, in_dir, out_dir);
+        let actual_compiled_path = actual_compiled_path.to_string_lossy();
+        let expected_compiled_path = "target/compiled/pkg/analyses/my_analysis.sql";
+        assert!(
+            path_separator_eq(&actual_compiled_path, expected_compiled_path),
+            "left: {actual_compiled_path:?}\nright: {expected_compiled_path:?}"
+        );
+
+        // Analyses are never materialized/run: Executable falls back to the definition path.
+        assert_eq!(
+            analysis
+                .get_node_path(NodePathKind::Executable, in_dir, out_dir)
+                .as_ref(),
+            Path::new("analyses/my_analysis.sql")
+        );
+    }
+
+    fn function_with_paths(name: &str, original_file_path: &str) -> DbtFunction {
+        let mut function = DbtFunction::default();
+        function.__common_attr__.name = name.to_string();
+        function.__common_attr__.package_name = "pkg".to_string();
+        function.__common_attr__.path = PathBuf::from(original_file_path);
+        function.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        function.__base_attr__.alias = name.to_string();
+        function
+    }
+
+    #[test]
+    fn function_node_paths_are_phase_accurate() {
+        let function = function_with_paths("my_function", "functions/my_function.sql");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        // Parse / Render: raw SQL file (original_file_path).
+        assert_eq!(
+            function
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            Path::new("functions/my_function.sql")
+        );
+
+        // Analysis: compiled SQL file.
+        let actual_compiled_path = function.get_node_path(NodePathKind::Compiled, in_dir, out_dir);
+        let actual_compiled_path = actual_compiled_path.to_string_lossy();
+        let expected_compiled_path = "target/compiled/pkg/functions/my_function.sql";
+        assert!(
+            path_separator_eq(&actual_compiled_path, expected_compiled_path),
+            "left: {actual_compiled_path:?}\nright: {expected_compiled_path:?}"
+        );
+
+        // Materialization: run path (functions are materialized, unlike analyses).
+        let actual_run_path = function.get_node_path(NodePathKind::Executable, in_dir, out_dir);
+        let actual_run_path = actual_run_path.to_string_lossy();
+        let expected_run_path = "target/run/pkg/functions/my_function.sql";
+        assert!(
+            path_separator_eq(&actual_run_path, expected_run_path),
+            "left: {actual_run_path:?}\nright: {expected_run_path:?}"
+        );
+    }
+
+    fn seed_with_paths(name: &str, original_file_path: &str) -> DbtSeed {
+        let mut seed = DbtSeed::default();
+        seed.__common_attr__.name = name.to_string();
+        seed.__common_attr__.package_name = "pkg".to_string();
+        seed.__common_attr__.path = PathBuf::from(original_file_path);
+        seed.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        seed.__base_attr__.alias = name.to_string();
+        seed
+    }
+
+    #[test]
+    fn seed_node_paths_are_phase_accurate() {
+        let seed = seed_with_paths("my_seed", "seeds/my_seed.csv");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        // Parse / Render: raw CSV file (original_file_path).
+        assert_eq!(
+            seed.get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            Path::new("seeds/my_seed.csv")
+        );
+
+        // Analysis: falls back to the raw CSV file — seeds are NOT in the Compiled arm.
+        assert_eq!(
+            seed.get_node_path(NodePathKind::Compiled, in_dir, out_dir)
+                .as_ref(),
+            Path::new("seeds/my_seed.csv")
+        );
+
+        // Materialization: run path (the `.csv` is replaced by `{alias}.sql`, not nested).
+        let actual_run_path = seed.get_node_path(NodePathKind::Executable, in_dir, out_dir);
+        let actual_run_path = actual_run_path.to_string_lossy();
+        let expected_run_path = "target/run/pkg/seeds/my_seed.sql";
+        assert!(
+            path_separator_eq(&actual_run_path, expected_run_path),
+            "left: {actual_run_path:?}\nright: {expected_run_path:?}"
+        );
+    }
+
+    fn source_with_paths(name: &str, original_file_path: &str) -> DbtSource {
+        let mut source = DbtSource::default();
+        source.__common_attr__.name = name.to_string();
+        source.__common_attr__.package_name = "pkg".to_string();
+        source.__common_attr__.path = PathBuf::from(original_file_path);
+        source.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        source.__base_attr__.alias = name.to_string();
+        source
+    }
+
+    #[test]
+    fn source_node_paths_are_phase_accurate() {
+        let source = source_with_paths("raw_customers", "models/__sources.yml");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        for kind in [
+            NodePathKind::Definition,
+            NodePathKind::Compiled,
+            NodePathKind::Executable,
+        ] {
+            assert_eq!(
+                source.get_node_path(kind, in_dir, out_dir).as_ref(),
+                Path::new("models/__sources.yml"),
+                "kind {kind:?} should fall back to the raw YAML definition path",
+            );
+        }
+
+        // The source freshness path unification relies on get_node_path(Definition)
+        // returning the same value the freshness call sites previously read from
+        // __common_attr__.path (parser sets path == original_file_path for sources).
+        assert_eq!(
+            source
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            source.__common_attr__.path.as_path(),
+        );
+    }
+
+    fn exposure_with_paths(name: &str, original_file_path: &str) -> DbtExposure {
+        let mut exposure = DbtExposure::default();
+        exposure.__common_attr__.name = name.to_string();
+        exposure.__common_attr__.package_name = "pkg".to_string();
+        exposure.__common_attr__.path = PathBuf::from(original_file_path);
+        exposure.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        exposure.__base_attr__.alias = name.to_string();
+        exposure
+    }
+
+    #[test]
+    fn exposure_node_paths_are_phase_accurate() {
+        let exposure = exposure_with_paths("weekly_dashboard", "models/exposures.yml");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        for kind in [
+            NodePathKind::Definition,
+            NodePathKind::Compiled,
+            NodePathKind::Executable,
+        ] {
+            assert_eq!(
+                exposure.get_node_path(kind, in_dir, out_dir).as_ref(),
+                Path::new("models/exposures.yml"),
+                "kind {kind:?} should fall back to the raw YAML definition path",
+            );
+        }
+
+        assert_eq!(
+            exposure
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            exposure.__common_attr__.path.as_path(),
+        );
+    }
+
+    fn metric_with_paths(name: &str, original_file_path: &str) -> DbtMetric {
+        let mut metric = DbtMetric::default();
+        metric.__common_attr__.name = name.to_string();
+        metric.__common_attr__.package_name = "pkg".to_string();
+        metric.__common_attr__.path = PathBuf::from(original_file_path);
+        metric.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        metric.__base_attr__.alias = name.to_string();
+        metric
+    }
+
+    #[test]
+    fn metric_node_paths_are_phase_accurate() {
+        let metric = metric_with_paths("revenue", "models/metrics.yml");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        for kind in [
+            NodePathKind::Definition,
+            NodePathKind::Compiled,
+            NodePathKind::Executable,
+        ] {
+            assert_eq!(
+                metric.get_node_path(kind, in_dir, out_dir).as_ref(),
+                Path::new("models/metrics.yml"),
+                "kind {kind:?} should fall back to the raw YAML definition path",
+            );
+        }
+
+        assert_eq!(
+            metric
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            metric.__common_attr__.path.as_path(),
+        );
+    }
+
+    fn saved_query_with_paths(name: &str, original_file_path: &str) -> DbtSavedQuery {
+        let mut saved_query = DbtSavedQuery::default();
+        saved_query.__common_attr__.name = name.to_string();
+        saved_query.__common_attr__.package_name = "pkg".to_string();
+        saved_query.__common_attr__.path = PathBuf::from(original_file_path);
+        saved_query.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        saved_query.__base_attr__.alias = name.to_string();
+        saved_query
+    }
+
+    #[test]
+    fn saved_query_node_paths_are_phase_accurate() {
+        let saved_query = saved_query_with_paths("daily_metrics", "models/saved_queries.yml");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        for kind in [
+            NodePathKind::Definition,
+            NodePathKind::Compiled,
+            NodePathKind::Executable,
+        ] {
+            assert_eq!(
+                saved_query.get_node_path(kind, in_dir, out_dir).as_ref(),
+                Path::new("models/saved_queries.yml"),
+                "kind {kind:?} should fall back to the raw YAML definition path",
+            );
+        }
+
+        assert_eq!(
+            saved_query
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            saved_query.__common_attr__.path.as_path(),
+        );
+    }
+
+    fn operation_with_paths(name: &str, original_file_path: &str) -> DbtOperation {
+        let mut operation = DbtOperation::default();
+        operation.__common_attr__.name = name.to_string();
+        operation.__common_attr__.package_name = "pkg".to_string();
+        operation.__common_attr__.path = PathBuf::from("hooks").join(format!("{name}.sql"));
+        operation.__common_attr__.original_file_path = PathBuf::from(original_file_path);
+        operation
+    }
+
+    #[test]
+    fn operation_node_paths_are_phase_accurate() {
+        // on-run-start/on-run-end hooks are declared in dbt_project.yml; every phase reports the
+        // raw project file (operations fall through to the definition path in get_node_path).
+        let operation = operation_with_paths("on_run_start_0", "./dbt_project.yml");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        for kind in [
+            NodePathKind::Definition,
+            NodePathKind::Compiled,
+            NodePathKind::Executable,
+        ] {
+            assert_eq!(
+                operation.get_node_path(kind, in_dir, out_dir).as_ref(),
+                Path::new("./dbt_project.yml"),
+                "kind {kind:?} should fall back to the raw dbt_project.yml definition path",
+            );
+        }
+
+        // The compiled artifact path is what the run_operation writer relies on: the hook .sql is
+        // nested under the raw dbt_project.yml definition path (many-to-one layout).
+        assert_eq!(
+            operation.get_node_path_abs(NodePathKind::Compiled, in_dir, out_dir),
+            PathBuf::from(
+                "/workspace/target/compiled/pkg/dbt_project.yml/hooks/on_run_start_0.sql"
+            )
+        );
+    }
+
+    fn macro_with_paths(name: &str, original_file_path: &str) -> DbtMacro {
+        DbtMacro {
+            name: name.to_string(),
+            package_name: "pkg".to_string(),
+            path: PathBuf::from(original_file_path),
+            original_file_path: PathBuf::from(original_file_path),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn macro_node_paths_are_phase_accurate() {
+        let dbt_macro = macro_with_paths("my_macro", "macros/my_macro.sql");
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        for kind in [
+            NodePathKind::Definition,
+            NodePathKind::Compiled,
+            NodePathKind::Executable,
+        ] {
+            assert_eq!(
+                dbt_macro.get_node_path(kind, in_dir, out_dir).as_ref(),
+                Path::new("macros/my_macro.sql"),
+                "kind {kind:?} should resolve to the raw .sql definition path",
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_sql_snapshot_node_paths_preserve_nested_compiled_layout() {
+        let snapshot = snapshot_with_paths(
+            "snap_non_matching",
+            "snapshots/snap_non_matching.sql",
+            "snapshots/snap_collide.sql",
+        );
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        assert_eq!(
+            snapshot
+                .get_node_path(NodePathKind::Definition, in_dir, out_dir)
+                .as_ref(),
+            Path::new("snapshots/snap_collide.sql")
+        );
+        assert_eq!(
+            snapshot.get_node_path_abs(NodePathKind::Compiled, in_dir, out_dir),
+            PathBuf::from(
+                "/workspace/target/compiled/pkg/snapshots/snap_collide.sql/snap_non_matching.sql"
+            )
+        );
+        assert_eq!(
+            snapshot
+                .get_node_path(NodePathKind::Executable, in_dir, out_dir)
+                .as_ref(),
+            Path::new("target/run/pkg/snapshots/snap_collide.sql/snapshots/snap_non_matching.sql")
+        );
+    }
+
+    #[test]
+    fn snapshot_node_evaluated_paths_are_phase_accurate() {
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+
+        let yaml_snapshot = snapshot_with_paths(
+            "daily_orders",
+            "snapshots/daily_orders.sql",
+            "snapshots/snapshots.yml",
+        );
+        assert_snapshot_evaluated_paths(
+            &yaml_snapshot,
+            in_dir,
+            out_dir,
+            "snapshots/snapshots.yml",
+            "target/compiled/pkg/snapshots/snapshots.yml/daily_orders.sql",
+            "target/run/pkg/snapshots/snapshots.yml/snapshots/daily_orders.sql",
+        );
+
+        let legacy_sql_snapshot = snapshot_with_paths(
+            "snap_non_matching",
+            "snapshots/snap_non_matching.sql",
+            "snapshots/snap_collide.sql",
+        );
+        assert_snapshot_evaluated_paths(
+            &legacy_sql_snapshot,
+            in_dir,
+            out_dir,
+            "snapshots/snap_collide.sql",
+            "target/compiled/pkg/snapshots/snap_collide.sql/snap_non_matching.sql",
+            "target/run/pkg/snapshots/snap_collide.sql/snapshots/snap_non_matching.sql",
+        );
+    }
+
+    #[test]
+    fn snapshot_node_evaluated_definition_paths_include_yaml_location() {
+        let in_dir = Path::new("/workspace");
+        let out_dir = Path::new("/workspace/target");
+        let mut snapshot = snapshot_with_paths(
+            "daily_orders",
+            "snapshots/daily_orders.sql",
+            "snapshots/snapshots.yml",
+        );
+        snapshot.__common_attr__.name_span = dbt_common::Span {
+            start: dbt_common::CodeLocationWithFile::new(2, 5, 18, "snapshots/snapshots.yml"),
+            stop: Default::default(),
+        };
+
+        for phase in [ExecutionPhase::Parse, ExecutionPhase::Render] {
+            let event = snapshot.get_node_evaluated_event(phase, in_dir, out_dir);
+            assert_eq!(event.relative_path, "snapshots/snapshots.yml");
+            assert_eq!(event.defined_at_line, Some(2));
+            assert_eq!(event.defined_at_col, Some(5));
+        }
+
+        for phase in [ExecutionPhase::Analyze, ExecutionPhase::Run] {
+            let event = snapshot.get_node_evaluated_event(phase, in_dir, out_dir);
+            assert_eq!(event.defined_at_line, None);
+            assert_eq!(event.defined_at_col, None);
+        }
+    }
+
+    fn assert_snapshot_evaluated_paths(
+        snapshot: &DbtSnapshot,
+        in_dir: &Path,
+        out_dir: &Path,
+        definition_path: &str,
+        compiled_path: &str,
+        run_path: &str,
+    ) {
+        for phase in [ExecutionPhase::Parse, ExecutionPhase::Render] {
+            assert_eq!(
+                snapshot
+                    .get_node_evaluated_event(phase, in_dir, out_dir)
+                    .relative_path,
+                definition_path
+            );
+        }
+        let actual_compiled_path = snapshot
+            .get_node_evaluated_event(ExecutionPhase::Analyze, in_dir, out_dir)
+            .relative_path;
+        assert!(
+            path_separator_eq(&actual_compiled_path, compiled_path),
+            "left: {actual_compiled_path:?}\nright: {compiled_path:?}"
+        );
+
+        let actual_run_path = snapshot
+            .get_node_evaluated_event(ExecutionPhase::Run, in_dir, out_dir)
+            .relative_path;
+        assert!(
+            path_separator_eq(&actual_run_path, run_path),
+            "left: {actual_run_path:?}\nright: {run_path:?}"
+        );
+    }
 
     #[test]
     fn snapshot_serialized_config_defaults_partial_meta_column_names() {
@@ -6252,7 +6828,7 @@ mod tests {
 }
 
 #[skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct DbtAnalysis {
     pub __common_attr__: CommonAttributes,
@@ -6403,4 +6979,205 @@ impl InternalDbtNodeAttributes for DbtAnalysis {
 // Saved queries don't have a relation, individual exports do.
 pub fn is_invalid_for_relation_comparison(node: &dyn InternalDbtNode) -> bool {
     node.resource_type() == NodeType::UnitTest || node.resource_type() == NodeType::SavedQuery
+}
+
+#[cfg(test)]
+mod seed_has_same_content_tests {
+    use std::path::PathBuf;
+
+    use dbt_adapter_core::AdapterType;
+
+    use crate::schemas::common::{DbtChecksum, DbtChecksumObject};
+    #[cfg(windows)]
+    use crate::schemas::nodes::DbtSeedAttr;
+    use crate::schemas::nodes::{CommonAttributes, DbtSeed, InternalDbtNode};
+
+    // ─────────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────────
+
+    fn sha256(digest: &str) -> DbtChecksum {
+        DbtChecksum::Object(DbtChecksumObject {
+            name: "sha256".to_string(),
+            checksum: digest.to_string(),
+        })
+    }
+
+    fn path_checksum(path: &str) -> DbtChecksum {
+        DbtChecksum::Object(DbtChecksumObject {
+            name: "path".to_string(),
+            checksum: path.to_string(),
+        })
+    }
+
+    /// Build a minimal `DbtSeed` with the supplied checksum. All other
+    /// fields that `has_same_content` inspects (fqn, config, description)
+    /// are left at their `Default` so paired seeds compare equal on every
+    /// dimension except the one being tested.
+    fn seed_with_checksum(checksum: DbtChecksum) -> DbtSeed {
+        DbtSeed {
+            __common_attr__: CommonAttributes {
+                checksum,
+                unique_id: "seed.test.demo_seed".to_string(),
+                name: "demo_seed".to_string(),
+                package_name: "test".to_string(),
+                fqn: vec!["test".to_string(), "demo_seed".to_string()],
+                path: PathBuf::from("seeds/demo_seed.csv"),
+                original_file_path: PathBuf::from("seeds/demo_seed.csv"),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Like `seed_with_checksum` but also sets `root_path` on `__seed_attr__`
+    /// so the Windows legacy-fallback code-path can locate the file.
+    #[cfg(windows)]
+    fn seed_with_checksum_and_root(checksum: DbtChecksum, root: PathBuf) -> DbtSeed {
+        DbtSeed {
+            __common_attr__: CommonAttributes {
+                checksum,
+                unique_id: "seed.test.demo_seed".to_string(),
+                name: "demo_seed".to_string(),
+                package_name: "test".to_string(),
+                fqn: vec!["test".to_string(), "demo_seed".to_string()],
+                path: PathBuf::from("seeds/demo_seed.csv"),
+                original_file_path: PathBuf::from("seeds/demo_seed.csv"),
+                ..Default::default()
+            },
+            __seed_attr__: DbtSeedAttr {
+                root_path: Some(root),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // has_same_content — body (checksum) comparisons
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn same_sha256_is_not_modified() {
+        let current = seed_with_checksum(sha256("abc123"));
+        let previous = seed_with_checksum(sha256("abc123"));
+        // Identical content hash → NOT state:modified
+        assert!(current.has_same_content(&previous as &dyn InternalDbtNode, AdapterType::DuckDB));
+    }
+
+    #[test]
+    fn different_sha256_is_modified() {
+        let current = seed_with_checksum(sha256("abc123"));
+        let previous = seed_with_checksum(sha256("def456"));
+        // Different content hash → IS state:modified
+        assert!(!current.has_same_content(&previous as &dyn InternalDbtNode, AdapterType::DuckDB));
+    }
+
+    #[test]
+    fn same_path_checksum_is_not_modified() {
+        // Both sides use path-based checksum (seed exceeds the limit on both runs).
+        // Same path → NOT modified (dbt-core's same_seeds behaviour for oversized seeds).
+        let current = seed_with_checksum(path_checksum("seeds/demo_seed.csv"));
+        let previous = seed_with_checksum(path_checksum("seeds/demo_seed.csv"));
+        assert!(current.has_same_content(&previous as &dyn InternalDbtNode, AdapterType::DuckDB));
+    }
+
+    #[test]
+    fn different_path_checksums_is_modified() {
+        // Seed moved to a different path → IS modified.
+        let current = seed_with_checksum(path_checksum("seeds/demo_seed.csv"));
+        let previous = seed_with_checksum(path_checksum("seeds/old_seed.csv"));
+        assert!(!current.has_same_content(&previous as &dyn InternalDbtNode, AdapterType::DuckDB));
+    }
+
+    #[test]
+    fn sha256_vs_path_is_modified() {
+        // Checksum *type* changed (e.g. limit was raised so the current run
+        // now hashes content, but the previous manifest stored a path checksum).
+        // The checksums can never be equal → IS modified.
+        let current = seed_with_checksum(sha256("abc123"));
+        let previous = seed_with_checksum(path_checksum("seeds/demo_seed.csv"));
+        assert!(!current.has_same_content(&previous as &dyn InternalDbtNode, AdapterType::DuckDB));
+    }
+
+    #[test]
+    fn downcast_fails_for_non_seed_returns_false() {
+        use crate::schemas::nodes::DbtModel;
+        let current = seed_with_checksum(sha256("abc123"));
+        let non_seed = DbtModel::default();
+        assert!(!current.has_same_content(&non_seed as &dyn InternalDbtNode, AdapterType::DuckDB));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Windows legacy-fallback
+    // ─────────────────────────────────────────────────────────────────
+
+    /// On Windows, if the new text-mode hash (CRLF→LF normalised) differs
+    /// from the old binary-mode hash stored in a previous-state manifest,
+    /// `has_same_content` re-hashes the file with the legacy method and
+    /// accepts it as "unchanged" when the legacy hash matches.
+    #[cfg(windows)]
+    #[test]
+    fn windows_legacy_fallback_accepts_unchanged_crlf_seed() {
+        use std::io::Write;
+
+        // Write a CRLF seed to a temp file.
+        let dir = std::env::temp_dir().join(format!(
+            "dbt_seed_legacy_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let seed_path = dir.join("seeds").join("demo_seed.csv");
+        std::fs::create_dir_all(seed_path.parent().unwrap()).unwrap();
+        {
+            let mut f = std::fs::File::create(&seed_path).unwrap();
+            f.write_all(b"id,name\r\n1,Alice\r\n2,Bob\r\n").unwrap();
+        }
+
+        // Simulate "previous-state manifest produced by the old binary-mode hasher".
+        let legacy_checksum = DbtChecksum::seed_content_checksum_legacy(
+            &std::fs::read(&seed_path).expect("failed to read seed file"),
+        );
+
+        // Simulate "current run uses the new text-mode hasher (CRLF→LF)".
+        // On Windows these two hashes DIFFER for CRLF content.
+        let new_checksum = DbtChecksum::seed_content_checksum(std::io::BufReader::new(
+            std::fs::File::open(&seed_path).unwrap(),
+        ))
+        .expect("new hash failed");
+
+        // Confirm the premise: the two hashes are indeed different on Windows.
+        assert_ne!(
+            new_checksum, legacy_checksum,
+            "expected CRLF hashes to differ between text-mode and binary-mode on Windows"
+        );
+
+        // current = newly hashed (text-mode), previous = old manifest (legacy)
+        let current = seed_with_checksum_and_root(new_checksum, dir.clone());
+        let previous = seed_with_checksum(legacy_checksum);
+
+        // The fallback should re-hash with legacy and accept the seed as unchanged.
+        assert!(
+            current.has_same_content(&previous as &dyn InternalDbtNode, AdapterType::DuckDB),
+            "Windows legacy fallback should treat an unchanged CRLF seed as not-modified"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cross-platform guard: if both hashes already agree (LF-only content or
+    /// non-Windows platform), the fallback must not spuriously change the result.
+    #[test]
+    fn legacy_fallback_does_not_change_result_when_seeds_truly_differ() {
+        // Use in-memory seeds — no filesystem needed.
+        // current has sha256("abc"), previous has sha256("xyz"): a genuine change.
+        let current = seed_with_checksum(sha256("aaaa"));
+        let previous = seed_with_checksum(sha256("bbbb"));
+        // Even if the fallback were to run, it cannot conjure a matching hash —
+        // `root_path` is None so the filesystem code is skipped entirely.
+        assert!(!current.has_same_content(&previous as &dyn InternalDbtNode, AdapterType::DuckDB));
+    }
 }

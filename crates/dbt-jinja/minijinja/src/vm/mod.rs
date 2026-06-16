@@ -280,6 +280,7 @@ impl<'env> Vm<'env> {
                 fuel_tracker: state.fuel_tracker.clone(),
 
                 pc,
+                pending_call_site: None,
             },
             Stack::from(args),
             pc,
@@ -1042,6 +1043,7 @@ impl<'env> Vm<'env> {
                             });
                         }
 
+                        state.record_pending_call_site(listeners, this_span);
                         let rv = call_wrapper(listeners, || func.call(state, args, listeners))
                             .map_err(|err| state.with_span_error(err, this_span))?;
                         // Handle CallerReturn: when a return() was called inside a {% call %} block,
@@ -1103,10 +1105,13 @@ impl<'env> Vm<'env> {
                                 // If we return DispatchObject from a
                                 // method call, we immediately forward
                                 // the call to the dispatch object.
-                                Some(obj) if obj.auto_execute => call_wrapper(listeners, || {
-                                    obj.call(state, &args[1..], listeners)
-                                })
-                                .map_err(|e| state.with_span_error(e, this_span))?,
+                                Some(obj) if obj.auto_execute => {
+                                    state.record_pending_call_site(listeners, this_span);
+                                    call_wrapper(listeners, || {
+                                        obj.call(state, &args[1..], listeners)
+                                    })
+                                    .map_err(|e| state.with_span_error(e, this_span))?
+                                }
                                 _ => rv,
                             },
                             Err(err) => {
@@ -1115,6 +1120,7 @@ impl<'env> Vm<'env> {
                                     .as_object()
                                     .and_then(|obj| obj.get_property(state, name, listeners).ok())
                                 {
+                                    state.record_pending_call_site(listeners, this_span);
                                     call_wrapper(listeners, || {
                                         property.call(state, &args[1..], listeners)
                                     })
@@ -1131,6 +1137,7 @@ impl<'env> Vm<'env> {
                 Instruction::CallObject(arg_count, span) => {
                     let args = stack.get_call_args(*arg_count);
                     let arg_count = args.len();
+                    state.record_pending_call_site(listeners, span);
                     let a = call_wrapper(listeners, || args[0].call(state, &args[1..], listeners))
                         .map_err(|e| state.with_span_error(e, span))?;
                     stack.drop_top(arg_count);
@@ -1278,6 +1285,41 @@ impl<'env> Vm<'env> {
                         let offset = *index + span.start_offset;
                         listeners.iter().for_each(|listener| {
                             listener.on_macro_stop(Some(path), &line, &col, &offset)
+                        });
+                    }
+                }
+                Instruction::JinjaLayoutEvent(kind, source_span) => {
+                    if current_macro_name.is_none() {
+                        let source_span =
+                            span_with_current_offset(source_span, &state.ctx.current_span);
+                        listeners.iter().for_each(|listener| {
+                            listener.on_jinja_layout_event(*kind, &source_span)
+                        });
+                    }
+                }
+                Instruction::JinjaLayoutEventIfLoopDidNotIterate(_kind, source_span) => {
+                    let did_not_iterate = state
+                        .ctx
+                        .current_loop()
+                        .is_some_and(|loop_ctx| loop_ctx.object.idx.load(Ordering::Relaxed) == 0);
+                    if did_not_iterate && current_macro_name.is_none() {
+                        let source_span =
+                            span_with_current_offset(source_span, &state.ctx.current_span);
+                        listeners
+                            .iter()
+                            .for_each(|listener| listener.on_jinja_loop_skipped_end(&source_span));
+                    }
+                }
+                Instruction::JinjaLayoutLoopIterationStart(source_span) => {
+                    let is_repeated_iteration = state
+                        .ctx
+                        .current_loop()
+                        .is_some_and(|loop_ctx| loop_ctx.object.idx.load(Ordering::Relaxed) > 0);
+                    if is_repeated_iteration && current_macro_name.is_none() {
+                        let source_span =
+                            span_with_current_offset(source_span, &state.ctx.current_span);
+                        listeners.iter().for_each(|listener| {
+                            listener.on_jinja_loop_iteration_start(&source_span)
                         });
                     }
                 }
@@ -1606,8 +1648,16 @@ impl<'env> Vm<'env> {
         let closure = stack.pop();
         let macro_ref_id = state.macros.len();
         Arc::make_mut(&mut state.macros).push((state.instructions, offset));
+        // dbt registers each macro as a template named `{package}.{macro_name}`,
+        // so the enclosing template's name yields the package this macro belongs to.
+        let package_name = state
+            .instructions
+            .name()
+            .split_once('.')
+            .map(|(package, _)| package.to_string());
         let m = Macro {
             name: Value::from(name),
+            package_name,
             arg_spec,
             macro_ref_id,
             state_id: state.id,

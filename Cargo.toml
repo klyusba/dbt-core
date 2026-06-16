@@ -41,10 +41,11 @@ members = [
   "crates/dbt-metadata",
   "crates/dbt-metadata-parquet",
   "crates/dbt-profile",
-  "crates/dbt-run-cache",
+  "crates/dbt-state",
   "crates/dbt-schemas",
   "crates/dbt-schema-store",
   "crates/dbt-telemetry",
+  "crates/dbt-tracing",
   "crates/dbt-selector-parser",
   "crates/dbt-scheduler",
   "crates/dbt-proc-macros",
@@ -80,6 +81,11 @@ members = [
   "crates/dbt-ci",
   "crates/dbt-login",
   "crates/dbt-platform-auth",
+]
+exclude = [
+  "wizard/wizard-app/src-tauri",
+  "wizard/dbt-codex",
+  "wizard/wizard-ui",
 ]
 
 resolver = "2"
@@ -247,8 +253,8 @@ dbt-platform-auth = { path = "crates/dbt-platform-auth" }
 dbt-pretty-table = { path = "crates/dbt-pretty-table" }
 dbt-proc-macros = { path = "crates/dbt-proc-macros" }
 dbt-profile = { path = "crates/dbt-profile" }
-dbt-run-cache = { path = "crates/dbt-run-cache" }
 dbt-scheduler = { path = "crates/dbt-scheduler" }
+dbt-state = { path = "crates/dbt-state" }
 
 dbt-metadata = { path = "crates/dbt-metadata" }
 dbt-metadata-parquet = { path = "crates/dbt-metadata-parquet" }
@@ -261,6 +267,7 @@ dbt-telemetry = { path = "crates/dbt-telemetry" }
 dbt-test-containers = { path = "crates/dbt-test-containers" }
 dbt-test-primitives = { path = "crates/dbt-test-primitives" }
 dbt-test-utils = { path = "crates/dbt-test-utils" }
+dbt-tracing = { path = "crates/dbt-tracing" }
 dbt-tui-progress = { path = "crates/dbt-tui-progress" }
 proto-rust = { path = "crates/proto-rust" }
 proto-rust-macros = { path = "crates/proto-rust-macros" }
@@ -302,6 +309,7 @@ dbt-yaml = { version = "0.9.5", features = [
   "schemars",
   "flatten_dunder",
 ] }
+erased-serde = "0.4.9"
 serde = { version = "1.0.147", default-features = false, features = ["derive"] }
 serde_derive = "1.0.215"
 serde_json = "1.0.133"
@@ -636,7 +644,7 @@ tower-http = { version = "0.6", features = ["trace"] }
 open = "5"
 
 # When updating these lints mind that some crates may not inherit form workspace
-# Use only "warn" in this section if you want to deny a lint. CI run will turn these 
+# Use only "warn" in this section if you want to deny a lint. CI run will turn these
 # into deny, and we don't want to disallow local compilation of "dirty" code.
 
 [workspace.lints.clippy]

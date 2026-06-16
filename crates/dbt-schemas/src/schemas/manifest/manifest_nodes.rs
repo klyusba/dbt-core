@@ -789,7 +789,9 @@ pub struct ManifestModel {
     pub group: Option<String>,
     #[serde(default)]
     pub config: ManifestModelConfig,
+    #[serialize_always]
     pub version: Option<StringOrInteger>,
+    #[serialize_always]
     pub latest_version: Option<StringOrInteger>,
     pub constraints: Option<Vec<ModelConstraint>>,
     pub deprecation_date: Option<String>,
@@ -1618,7 +1620,7 @@ pub struct ManifestMetric {
     pub config: ManifestMetricConfig,
 
     #[serde(default)]
-    pub metrics: Vec<Vec<String>>,
+    pub metrics: Vec<Vec<String>>, // TODO: seems unused, can this be removed?
 
     pub __other__: BTreeMap<String, YmlValue>,
 }
@@ -1653,7 +1655,7 @@ impl From<DbtMetric> for ManifestMetric {
             group: metric.__metric_attr__.group.clone(),
             config: metric.deprecated_config.into(),
             __other__: metric.__other__,
-            metrics: vec![], // TODO: metric.__metric_attr__.metrics.clone(),
+            metrics: vec![],
         }
     }
 }

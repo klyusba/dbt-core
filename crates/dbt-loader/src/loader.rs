@@ -758,6 +758,12 @@ pub async fn load_simplified_project_and_profiles(
             minijinja::Value::from_object(Var::new(merged_vars)),
         ),
         (
+            // Add empty target object. When we call `load_project_yml` later,
+            // target will actually be populated.
+            "target".to_owned(),
+            minijinja::Value::from_serialize(BTreeMap::<String, minijinja::Value>::new()),
+        ),
+        (
             // Add empty context object (mimics dbt-core's BaseContext.to_dict() pattern)
             // This allows profiles.yml to use: context.project_name or ''
             "context".to_owned(),
@@ -1010,24 +1016,15 @@ pub async fn load_inner(
         model_sql_files.extend(python_model_files);
         model_sql_files.sort_by(|a, b| a.path.cmp(&b.path));
     }
-    let mut function_sql_files = find_files_by_kind_and_extension(
+    let mut function_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,
         &ResourcePathKind::FunctionPaths,
-        &["sql"],
+        &["sql", "py", "js"],
         &all_files,
     );
-    let python_function_files = find_files_by_kind_and_extension(
-        package_path,
-        &dbt_project.name,
-        &ResourcePathKind::FunctionPaths,
-        &["py"],
-        &all_files,
-    );
-    if !python_function_files.is_empty() {
-        function_sql_files.extend(python_function_files);
-        function_sql_files.sort_by(|a, b| a.path.cmp(&b.path));
-    }
+    function_files.sort_by(|a, b| a.path.cmp(&b.path));
+
     let macro_files = find_files_by_kind_and_extension(
         package_path,
         &dbt_project.name,
@@ -1090,7 +1087,7 @@ pub async fn load_inner(
         dbt_properties,
         analysis_files,
         model_sql_files,
-        function_sql_files,
+        function_sql_files: function_files,
         test_files,
         fixture_files,
         seed_files,

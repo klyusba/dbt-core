@@ -24,11 +24,12 @@ dbt-frontend-common = { workspace = true }
 dbt-fusion-workspace-hack = { version = "0.1" }
 dbt-jinja-utils = { workspace = true }
 dbt-pretty-table = { workspace = true }
-dbt-run-cache = { workspace = true }
 dbt-scheduler = { workspace = true }
 dbt-schema-store = { workspace = true }
 dbt-schemas = { workspace = true }
+dbt-state = { workspace = true }
 dbt-telemetry = { workspace = true }
+dbt-tracing = { workspace = true }
 dbt-xdbc = { workspace = true }
 dbt-yaml = { workspace = true }
 

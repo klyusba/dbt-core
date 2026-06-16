@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use crate::config::CompilationConfig;
@@ -13,7 +13,6 @@ use dbt_adapter::{
     cache::RelationCache,
     config::AdapterConfig,
     engine::{SidecarClient, SidecarEngine, query_comment::QueryCommentConfig},
-    query_cache::{QueryCacheConfig, QueryCacheImpl},
     sql_types::TypeOpsFactory,
 };
 use dbt_common::{
@@ -560,7 +559,6 @@ impl DbtLoadedProject {
     pub fn init_adapter(
         &self,
         resolved_state: &ResolverState,
-        io: &IoArgs,
         replay_mode: Option<ReplayMode>,
         jinja_env: &JinjaEnv,
         schema_store: Option<Arc<dyn SchemaStoreTrait>>,
@@ -605,11 +603,8 @@ impl DbtLoadedProject {
         // recording. Route those runs through the factory so it builds a replay
         // adapter instead; sidecar execution still goes through the db_runner.
         let is_mantle_replay = matches!(&replay_mode, Some(ReplayMode::MantleReplay(_)));
-        let executes_locally = !introspect_enabled
-            || matches!(
-                execute,
-                Execute::Local | Execute::Sidecar | Execute::Service
-            );
+        let executes_locally =
+            !introspect_enabled || matches!(execute, Execute::Sidecar | Execute::Service);
         let use_local_mock_adapter = executes_locally && !is_mantle_replay;
         let adapter = if adapter_type == AdapterType::DuckDB {
             adapter_factory
@@ -620,7 +615,6 @@ impl DbtLoadedProject {
                     replay_mode,
                     flags.project_flags(),
                     schema_store,
-                    None,
                     root_project_quoting,
                     query_comment,
                     token.clone(),
@@ -659,7 +653,7 @@ impl DbtLoadedProject {
                 );
                 Arc::new(Adapter::new(Arc::new(adapter_impl), None, token.clone()))
             } else {
-                // Execute::Local or fallback: use mock adapter
+                // Fallback: use mock adapter
                 let mock = AdapterImpl::new_mock(
                     adapter_type,
                     flags.project_flags(),
@@ -678,18 +672,6 @@ impl DbtLoadedProject {
                     replay_mode,
                     flags.project_flags(),
                     schema_store,
-                    if io.beta_use_query_cache {
-                        Some(Arc::new(QueryCacheImpl::new(QueryCacheConfig::new(
-                            io.out_dir.join("query_cache"),
-                            Some(Duration::from_secs(60 * 60 * 12)),
-                            vec![
-                                dbt_adapter_core::DBT_EXECUTION_PHASE_RENDER,
-                                dbt_adapter_core::DBT_EXECUTION_PHASE_ANALYZE,
-                            ],
-                        ))))
-                    } else {
-                        None
-                    },
                     root_project_quoting,
                     query_comment,
                     token.clone(),
@@ -722,7 +704,6 @@ impl DbtLoadedProject {
             type_ops_factory,
             None, // replay_mode
             BTreeMap::new(),
-            None,
             None,
             DEFAULT_RESOLVED_QUOTING,
             None,

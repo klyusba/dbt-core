@@ -92,6 +92,10 @@ impl DbtAsset {
         self.path.extension().and_then(|ext| ext.to_str()) == Some("py")
     }
 
+    pub fn is_javascript(&self) -> bool {
+        self.path.extension().and_then(|ext| ext.to_str()) == Some("js")
+    }
+
     /// Assumes all paths used are canonicalized
     pub fn to_display_path(&self, project_root: &Path) -> PathBuf {
         let absolute_path = self.base_path.join(&self.path);
@@ -826,6 +830,10 @@ impl Default for InvocationArgs {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DbtRuntimeConfigInner {
     // Profile configuration
@@ -879,6 +887,12 @@ pub struct DbtRuntimeConfigInner {
 
     // Runtime info
     pub invoked_at: DateTime<Utc>,
+
+    // Project flags
+    /// When true, `latest_version_pointer` is enabled by default for all versioned models
+    /// (can be overridden per-model with `latest_version_pointer: {enabled: false}`)
+    #[serde(default = "default_true")]
+    pub latest_version_pointer_enabled_by_default: bool,
 }
 
 impl DbtRuntimeConfig {
@@ -975,6 +989,13 @@ impl DbtRuntimeConfig {
             restrict_access: package.dbt_project.restrict_access,
             invoked_at: Utc::now(),
             args: InvocationArgs::default(),
+            latest_version_pointer_enabled_by_default: package
+                .dbt_project
+                .flags
+                .as_ref()
+                .and_then(|flags| flags.get("latest_version_pointer_enabled_by_default"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
         };
 
         // TODO(anna): Look into whether this should also be Index map

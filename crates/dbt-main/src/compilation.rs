@@ -61,8 +61,8 @@ use dbt_metadata::file_registry::CompleteStateWithKind;
 use dbt_schemas::{
     filter::RunFilter,
     schemas::{
-        CommonAttributes, Nodes, ResolvedCloudConfig, common::ResolvedQuoting,
-        manifest::DbtManifestV12, profiles::Execute, project::DbtProject,
+        Nodes, ResolvedCloudConfig, common::ResolvedQuoting, manifest::DbtManifestV12,
+        profiles::Execute, project::DbtProject,
         semantic_layer::semantic_manifest::SemanticManifest,
     },
     state::{CacheState, DbtPackage, DbtState, Macros, ModelStatus, ResolverState},
@@ -305,10 +305,10 @@ impl<'a> CompilationPhasesExecutor<'a> {
     }
 
     /// Emit Vortex resource_counts if instrumentation is enabled
-    fn resource_counts_event(&self, resolved_state: &ResolverState) {
+    fn resource_counts_event(&self, resolved_state: &ResolverState, catalog_count: i32) {
         if self.arg.send_anonymous_usage_stats {
             let invocation_args = InvocationArgs::from_eval_args(self.arg.as_ref());
-            resource_counts_event(invocation_args, resolved_state);
+            resource_counts_event(invocation_args, resolved_state, catalog_count);
         }
     }
 
@@ -658,10 +658,6 @@ impl DbtProjectCompilationCacheState {
             .map(|x| x.into_inner())
     }
 
-    pub fn get_compiled_sql_path(&self, io: &IoArgs, common: &CommonAttributes) -> PathBuf {
-        self.compiled_sql_cache.get_compiled_sql_path(io, common)
-    }
-
     pub fn data_store(&self) -> Arc<DataStore> {
         self.data_store.clone()
     }
@@ -676,10 +672,6 @@ impl CompilationCache for DbtProjectCompilationCacheState {
         self.schema_store
             .get_schema_by_unique_id(unique_id)
             .map(|x| x.into_inner())
-    }
-
-    fn get_compiled_sql_path(&self, io: &IoArgs, common: &CommonAttributes) -> PathBuf {
-        self.compiled_sql_cache.get_compiled_sql_path(io, common)
     }
 
     fn schema_store(&self) -> Arc<SchemaStore> {
@@ -1198,7 +1190,20 @@ impl DbtProjectCompilation {
         let semantic_manifest = SemanticManifest::from(&resolved_state.nodes);
         token.check_cancellation()?;
 
-        executor.resource_counts_event(&resolved_state);
+        // Catalogs are parsed into DbtState (catalogs.yml), not ResolverState, so
+        // count them here from the loaded project where DbtState is in scope, and
+        // pass the count through to the telemetry event. Both v1 and v2
+        // catalogs.yml store their entries under the top-level `catalogs` key.
+        let catalog_count = {
+            let dbt_state = loaded_project.dbt_state();
+            dbt_state
+                .catalogs
+                .as_ref()
+                .and_then(|catalogs| catalogs.catalogs_seq().ok())
+                .map(|seq| seq.len() as i32)
+                .unwrap_or(0)
+        };
+        executor.resource_counts_event(&resolved_state, catalog_count);
         token.check_cancellation()?;
 
         let metricflow_server_client =
@@ -1638,7 +1643,6 @@ impl DbtProjectCompilation {
         // Initialize adapter
         let adapter = self.loaded_project().init_adapter(
             &self.resolved_state,
-            &arg.io,
             arg.replay.clone(),
             &jinja_env,
             Some(schema_store.clone()),
@@ -1760,13 +1764,11 @@ impl DbtProjectCompilation {
         }
 
         let base_context = build_base_context(&resolved_state, &jinja_env);
-        if let Some(qc) = adapter.engine().query_cache() {
+        if adapter.engine().has_query_cache() {
             let reverse_deps = reverse(&schedule.deps);
-            let converted: HashMap<String, HashSet<String>> = reverse_deps
-                .into_iter()
-                .map(|(k, vs)| (k, vs.into_iter().collect()))
-                .collect();
-            qc.set_reverse_deps(converted);
+            adapter
+                .engine()
+                .set_query_cache_reverse_deps(reverse_deps)?;
         }
         token.check_cancellation()?;
 
@@ -2048,6 +2050,18 @@ impl DbtProjectCompilation {
             None => pending_runner.into_empty_results()?,
         };
 
+        // Shut down the adapter-level sidecar client so its dbt-db-runner
+        // subprocess releases the DuckDB advisory lock before the next
+        // invocation starts. In the in-process test model the tokio runtime is
+        // shared across sequential TaskSeq steps, so without an explicit
+        // shutdown the background reader tasks keep Arc<RunnerManager> alive
+        // (preventing Drop from firing) and the runner holds the DB lock
+        // indefinitely. The task-runner sidecar is shut down separately in
+        // did_collect_all_run_task_results via ext.local_engine.shutdown().
+        if let Some(client) = &sidecar_client {
+            let _ = client.shutdown();
+        }
+
         token.check_cancellation()?;
 
         // Flush the parquet schema cache to disk (no-op for non-ParquetCache stores).
@@ -2304,7 +2318,6 @@ async fn write_catalog(
     let execute = Execute::from_compute_flag(arg.local_execution_backend);
     let adapter = loaded_project.init_adapter(
         resolved_state,
-        &arg.io,
         arg.replay.clone(),
         jinja_env,
         None,
