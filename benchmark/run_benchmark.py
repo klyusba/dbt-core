@@ -31,7 +31,8 @@ SAMPLE_INDICES = list(range(1, 100, 5))
 COMMON_FLAGS = [
     "--project-dir", PROJECT_DIR,
     "--profiles-dir", PROJECT_DIR,
-    "--log-level", "off",
+    # "--log-level", "off",
+    "--debug",
     "--no-write-json",
 ]
 
@@ -42,13 +43,20 @@ def run(
     cmd: List[str],
     check: bool = True,
     env: Optional[dict] = None,
+    input: Optional[str] = None,
 ) -> Tuple[float, int]:
     """Run *cmd*, return (wall_seconds, returncode)."""
     t0 = time.perf_counter()
+    if isinstance(input, str):
+        input = input.encode()
     result = subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, input=input
     )
     elapsed = time.perf_counter() - t0
+
+    stdout = result.stdout.decode(errors="replace")
+    print(stdout[-2000:])
+
     if check and result.returncode != 0:
         stderr = result.stderr.decode(errors="replace")
         stdout = result.stdout.decode(errors="replace")
@@ -94,13 +102,13 @@ def warmup_driver() -> None:
     """Materialise model_0000 so the DuckDB ADBC driver is downloaded+cached."""
     print("  Warming up ADBC driver (first run downloads the DuckDB driver) …",
           flush=True)
-    run([DBT_BIN, "run", "--select", "model_0000"] + COMMON_FLAGS)
+    run([DBT_BIN, "run"] + COMMON_FLAGS, input="model_0000")
 
 
 def full_run() -> float:
     """Run all models once so every upstream table exists. Returns wall time."""
     print("  Running all 1 000 models to populate the database …", flush=True)
-    elapsed, _ = run([DBT_BIN, "run"] + COMMON_FLAGS)
+    elapsed, _ = run([DBT_BIN, "run"] + COMMON_FLAGS, input="*")
     return elapsed
 
 
@@ -111,7 +119,7 @@ def bench_run_single(indices: List[int]) -> List[float]:
     times = []
     for idx in indices:
         m = model_name(idx)
-        elapsed, _ = run([DBT_BIN, "run", "--select", m] + COMMON_FLAGS)
+        elapsed, _ = run([DBT_BIN, "run"] + COMMON_FLAGS, input=m)
         times.append(elapsed)
         print(f"    {m}: {fmt_ms(elapsed)}", flush=True)
     return times
@@ -129,25 +137,7 @@ def bench_run_stdin(indices: List[int]) -> Tuple[float, int]:
     Returns (total_elapsed_seconds, number_of_selectors).
     """
     selectors = "\n".join(model_name(idx) for idx in indices) + "\n"
-
-    t0 = time.perf_counter()
-    result = subprocess.run(
-        [DBT_BIN, "run"] + COMMON_FLAGS,
-        input=selectors.encode(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    elapsed = time.perf_counter() - t0
-
-    if result.returncode != 0:
-        stderr = result.stderr.decode(errors="replace")
-        stdout = result.stdout.decode(errors="replace")
-        raise RuntimeError(
-            f"dbt stdin run failed (rc={result.returncode}):\n"
-            f"--- stdout ---\n{stdout[-2000:]}\n"
-            f"--- stderr ---\n{stderr[-2000:]}"
-        )
-
+    elapsed, _ = run([DBT_BIN, "run"] + COMMON_FLAGS, input=selectors)
     return elapsed, len(indices)
 
 # ── results printer ───────────────────────────────────────────────────────────

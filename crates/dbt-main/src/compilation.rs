@@ -1919,9 +1919,12 @@ impl DbtProjectCompilation {
                 break;
             }
 
+            emit_info_log_message(format!("stdin loop: received selector '{select}'"));
+
             // Use the user input to prepare a new schedule.
             use dbt_common::node_selector::parse_model_specifiers;
             let select_expr = parse_model_specifiers(&[select.to_string()])?;
+            emit_info_log_message("stdin loop: building schedule");
             let new_schedule = schedule_with_select(
                 &self.resolved_state,
                 SchedulerArgs::from_eval_args(arg),
@@ -1932,6 +1935,11 @@ impl DbtProjectCompilation {
                 token,
             )
             .await?;
+
+            emit_info_log_message(format!(
+                "stdin loop: schedule built — {} node(s) selected",
+                new_schedule.selected_nodes.len()
+            ));
 
             // Increment counters used in final run reporting.
             new_schedule.selected_nodes.iter().for_each(|unique_id| {
@@ -1978,9 +1986,14 @@ impl DbtProjectCompilation {
                 Arc::clone(&static_analysis_buckets),
             );
 
+            emit_info_log_message(format!(
+                "stdin loop: running tasks for command '{:?}'",
+                run_task_args.command
+            ));
             let result = if run_task_args.command == FsCommand::Extension("jinja-check")
                 || should_skip_tasks_when_no_selected_nodes(&run_task_args.command, &new_schedule)
             {
+                emit_info_log_message("stdin loop: skipping tasks (no selected nodes or jinja-check)");
                 runner.into_empty_results()?
             } else {
                 // Whether any selected node is in the dynamic closure so we only register hook UDFs
@@ -2026,6 +2039,7 @@ impl DbtProjectCompilation {
                     .await?
             };
 
+            emit_info_log_message("stdin loop: iteration complete, waiting for next selector");
             run_task_results = Some(result);
         }
 
