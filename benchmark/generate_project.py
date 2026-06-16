@@ -13,7 +13,7 @@ import random
 import string
 import sys
 
-NUM_MODELS = 1000
+NUM_MODELS = 100
 STRING_LEN = 16_384  # characters per literal; two per model → ~32 kB SQL per file
 
 

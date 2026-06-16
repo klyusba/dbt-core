@@ -1,70 +1,33 @@
 ╔══════════════════════════════════════════════════════════════════╗
-║                  dbt benchmark results (10 models)               ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Full dbt run (10 models, setup)                       397.3 ms  ║
-║  ─────────────────────────────────────────────────────────────── ║
-║  dbt run --select X  (n=9 models)                                ║
-║    mean ± stdev (per invocation)              297.7 ms ± 5.1 ms  ║
-║    min                                                 291.1 ms  ║
-║    max                                                 304.3 ms  ║
-║  ─────────────────────────────────────────────────────────────── ║
-║  dbt-daemon run --select X  (n=9 models)                         ║
-║    mean ± stdev (per invocation)               54.7 ms ± 0.9 ms  ║
-║    min                                                  53.4 ms  ║
-║    max                                                  56.0 ms  ║
-║    speedup vs plain dbt run                               5.44×  ║
-╚══════════════════════════════════════════════════════════════════╝
-
-
-╔══════════════════════════════════════════════════════════════════╗
 ║                  dbt benchmark results (100 models)              ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Full dbt run (100 models, setup)                     1500.6 ms  ║
+║  Full dbt run (100 models, setup)                     1465.0 ms  ║
 ║  ──────────────────────────────────────────────────────────────  ║
-║  dbt run --select X  (n=20 models)                               ║
-║    mean ± stdev (per invocation)              331.4 ms ± 5.5 ms  ║
-║    min                                                 323.8 ms  ║
-║    max                                                 343.9 ms  ║
+║  dbt run --select X  (n=20, separate processes)                  ║
+║    mean ± stdev (per invocation)             330.1 ms ± 30.4 ms  ║
+║    min / max                                317.1 ms / 458.7 ms  ║
+║    total                                              6602.1 ms  ║
 ║  ──────────────────────────────────────────────────────────────  ║
-║  dbt-daemon run --select X  (n=20 models)                        ║
-║    mean ± stdev (per invocation)               98.1 ms ± 5.1 ms  ║
-║    min                                                  90.1 ms  ║
-║    max                                                 108.5 ms  ║
-║    speedup vs plain dbt run                               3.38×  ║
+║  dbt run stdin loop  (n=20, single process)                      ║
+║    total                                               500.5 ms  ║
+║    avg per selector                                     25.0 ms  ║
+║  ──────────────────────────────────────────────────────────────  ║
+║  Speedup  (stdin loop vs separate processes)             13.19×  ║
 ╚══════════════════════════════════════════════════════════════════╝
-
 
 ╔══════════════════════════════════════════════════════════════════╗
 ║                  dbt benchmark results (1 000 models)            ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  Full dbt run (1 000 models, setup)                  12877.7 ms  ║
+║  Full dbt run (1 000 models, setup)                  12494.2 ms  ║
+║  ─────────────────────────────────────────────────────────────── ║
+║  dbt run --select X  (n=20, separate processes)                  ║
+║    mean ± stdev (per invocation)             697.8 ms ± 10.5 ms  ║
+║    min / max                                684.0 ms / 718.7 ms  ║
+║    total                                             13955.0 ms  ║
 ║  ──────────────────────────────────────────────────────────────  ║
-║  dbt run --select X  (n=20 models)                               ║
-║    mean ± stdev (per invocation)              712.3 ms ± 9.9 ms  ║
-║    min                                                 697.3 ms  ║
-║    max                                                 729.0 ms  ║
+║  dbt run stdin loop  (n=20, single process)                      ║
+║    total                                               874.4 ms  ║
+║    avg per selector                                     43.7 ms  ║
 ║  ──────────────────────────────────────────────────────────────  ║
-║  dbt-daemon run --select X  (n=20 models)                        ║
-║    mean ± stdev (per invocation)             552.2 ms ± 67.8 ms  ║
-║    min                                                 485.7 ms  ║
-║    max                                                 687.6 ms  ║
-║    speedup vs plain dbt run                               1.29×  ║
-╚══════════════════════════════════════════════════════════════════╝
-
-
-╔══════════════════════════════════════════════════════════════════╗
-║                  dbt benchmark results (5 000 models)            ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Full dbt run (5 000 models, setup)                  65200.4 ms  ║
-║  ──────────────────────────────────────────────────────────────  ║
-║  dbt run --select X  (n=20 models)                               ║
-║    mean ± stdev (per invocation)           2433.1 ms ± 141.1 ms  ║
-║    min                                                2365.4 ms  ║
-║    max                                                2995.6 ms  ║
-║  ──────────────────────────────────────────────────────────────  ║
-║  dbt-daemon run --select X  (n=20 models)                        ║
-║    mean ± stdev (per invocation)           2381.6 ms ± 108.6 ms  ║
-║    min                                                2223.8 ms  ║
-║    max                                                2703.2 ms  ║
-║    speedup vs plain dbt run                               1.02×  ║
+║  Speedup  (stdin loop vs separate processes)             15.96×  ║
 ╚══════════════════════════════════════════════════════════════════╝
